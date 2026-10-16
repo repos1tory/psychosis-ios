@@ -1,0 +1,7 @@
+*.dylib
+*.deb
+psychosis
+mdctl
+layout/var/jb/usr/bin/psychosis
+layout/var/jb/usr/bin/mdctl
+layout/var/jb/Library/MobileSubstrate/DynamicLibraries/Psychosis.dylib
