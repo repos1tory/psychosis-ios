@@ -1,0 +1,40 @@
+name: notify repo site
+
+# For repos that build on-device (or publish by hand): when a GitHub Release is
+# published, tell the APT repo to ingest its .deb(s).
+#
+# Needs: DISPATCH_TOKEN secret (fine-grained PAT, Contents: write on
+# repos1tory/repos1tory.github.io).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to re-ingest"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+    steps:
+      - name: Dispatch to repos1tory.github.io
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::DISPATCH_TOKEN is not set — the release exists but the APT repo was not updated."
+            exit 0
+          fi
+          GH_TOKEN="$TOKEN" gh api repos/repos1tory/repos1tory.github.io/dispatches \
+            -f event_type=package-release \
+            -f "client_payload[repo]=$GITHUB_REPOSITORY" \
+            -f "client_payload[tag]=$TAG" \
+            -f "client_payload[group]=tweaks"
+          echo "dispatched $GITHUB_REPOSITORY $TAG"
