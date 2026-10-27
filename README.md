@@ -1,5 +1,9 @@
 # Psychosis
 
+Source: [repos1tory/psychosis-ios](https://github.com/repos1tory/psychosis-ios).
+The current package is `com.alsinas.psychosis` 0.7.1 for rootless
+`iphoneos-arm64` devices.
+
 Psychosis is a rootless iOS automation tweak and on-device CLI. The tweak runs in SpringBoard and binds its line protocol to `127.0.0.1:6001`; host automation reaches it by SSH and runs `psychosis` on the device. The server is not exposed on the LAN.
 
 The short command is **`psi`** — **P**sychosis **S**ystem **I**nterface, also evoking the Greek letter ψ. Both names run the same executable, with identical arguments and exit codes.
