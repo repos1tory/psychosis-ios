@@ -1,4 +1,4 @@
-// mdctl - host/on-device client for MDControl.dylib (127.0.0.1:6001).
+// psychosis / psi - host/on-device client for Psychosis.dylib (127.0.0.1:6001).
 #include "mdc_protocol.h"
 
 #include <errno.h>
@@ -14,16 +14,19 @@
 static void usage(const char *name) {
     fprintf(stderr,
         "usage: %s ping | tap X Y [W H] | swipe X1 Y1 X2 Y2 [steps [W H]] |\n"
-        "       %s home | volup | launch BUNDLE_ID | ax [depth] | type TEXT |\n"
+        "       %s home | volup | launch BUNDLE_ID | ax [depth] | size | type TEXT |\n"
         "       %s notify TEXT | shot [PATH] | front | wake | unlock [PASSCODE] |\n"
-        "       %s tapname LABEL | wait [--gone] LABEL | scroll up|down|left|right [POINTS] [W H] |\n"
+        "       %s tapname LABEL | wait [--gone] LABEL |\n"
+        "       %s scroll up|down|left|right [POINTS] [W H] [--settle[=MS]|--fast] |\n"
+        "       %s scrolltop | scrollbottom | scrollto [--up|--down] LABEL | scrolloffset [LABEL] |\n"
         "       %s toast TEXT | say [v=VOL] [voice=NAME] TEXT (say voices lists) |\n"
         "       %s record [SECONDS] [PATH] | listen [TIMEOUT_S] [SILENCE_MS] [MIN_SPEECH_MS] |\n"
         "       %s longpress X Y [MS] [W H] | doubletap X Y [W H] |\n"
         "       %s drag X1 Y1 X2 Y2 [HOLD_MS] [STEPS] [W H] |\n"
         "       %s clipboard get | clipboard set TEXT | key [cmd+][shift+]NAME | open_url URL\n"
-        "Coordinates use a 768x1024 portrait screen by default.\n",
-        name, name, name, name, name, name, name, name, name);
+        "Coordinates and ax frames use the device's live screen space (`%s size`).\n"
+        "W H overrides the input space only; it does not resize or rotate the target.\n",
+        name, name, name, name, name, name, name, name, name, name, name, name);
 }
 
 static int send_all(int fd, const char *data, size_t length) {
@@ -90,9 +93,13 @@ int main(int argc, char **argv) {
     line[used] = 0;
 
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) { perror("mdctl: socket"); return 1; }
+    if (s < 0) { perror("psychosis: socket"); return 1; }
     struct timeval receive_timeout = {
         .tv_sec = (parsed.type == MDC_CMD_AX || parsed.type == MDC_CMD_TYPE) ? 60
+                   : (parsed.type == MDC_CMD_SCROLLTO || parsed.type == MDC_CMD_SCROLLTOP ||
+                      parsed.type == MDC_CMD_SCROLLBOTTOM) ? 240
+                   : parsed.type == MDC_CMD_SCROLL ? 120
+                   : parsed.type == MDC_CMD_SCROLLOFFSET ? 30
                    : parsed.type == MDC_CMD_SAY ? 200
                    : parsed.type == MDC_CMD_RECORD ? 140
                    : parsed.type == MDC_CMD_LISTEN_TURN
@@ -109,12 +116,12 @@ int main(int argc, char **argv) {
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(6001);
     if (connect(s, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        perror("mdctl: connect 127.0.0.1:6001 (is Psychosis loaded?)");
+        perror("psychosis: connect 127.0.0.1:6001 (is Psychosis loaded?)");
         close(s);
         return 1;
     }
     if (send_all(s, line, used) != 0) {
-        perror("mdctl: send"); close(s); return 1;
+        perror("psychosis: send"); close(s); return 1;
     }
 
     char response[4096];
@@ -124,7 +131,7 @@ int main(int argc, char **argv) {
     for (;;) {
         ssize_t n = recv(s, response, sizeof(response), 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n < 0) { perror("mdctl: recv"); close(s); return 1; }
+        if (n < 0) { perror("psychosis: recv"); close(s); return 1; }
         if (n == 0) break;
         if (initial < sizeof(prefix)) {
             size_t add = (size_t)n < sizeof(prefix) - initial ? (size_t)n : sizeof(prefix) - initial;
@@ -134,7 +141,7 @@ int main(int argc, char **argv) {
                 failed = 1;
         }
         if (fwrite(response, 1, (size_t)n, stdout) != (size_t)n) {
-            perror("mdctl: stdout"); close(s); return 1;
+            perror("psychosis: stdout"); close(s); return 1;
         }
         if (parsed.type != MDC_CMD_AX && parsed.type != MDC_CMD_CLIPBOARD_GET &&
             memchr(response, '\n', (size_t)n)) break;

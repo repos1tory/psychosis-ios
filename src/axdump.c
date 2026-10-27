@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "mdc_protocol.h"
 #include "mdc_mainthread.h"
+#include "mdc_services.h"
 
 typedef void *OID;
 typedef void *OSEL;
@@ -220,12 +221,12 @@ static void ax_log(const char *fmt, ...) {
     if (n <= 0) return;
     size_t len = (size_t)n < sizeof(line) - 2 ? (size_t)n : sizeof(line) - 2;
     line[len++] = '\n';
-    int fd = open("/var/mobile/Library/Logs/MDControl-ax.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int fd = open("/var/mobile/Library/Logs/Psychosis-ax.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd >= 0) { (void)write(fd, line, len); close(fd); }
 }
 
 static void ax_log_reset(void) {
-    int fd = open("/var/mobile/Library/Logs/MDControl-ax.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open("/var/mobile/Library/Logs/Psychosis-ax.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) close(fd);
 }
 
@@ -884,6 +885,23 @@ static int serialize_json(OID root, char **out, size_t *outlen) {
     return 0;
 }
 
+/* Live coordinate spaces, exported alongside the tree so callers can reuse
+ * ax frames directly in tap/scroll commands. */
+static OID ax_space_status(void) {
+    double sw = 0, sh = 0, fw = 0, fh = 0;
+    OID space = M_id0(C("NSMutableDictionary"), S("dictionary"));
+    if (mdc_screen_size(&sw, &sh) == 0 && sw > 0 && sh > 0) {
+        setInt(space, "width", (int)(sw + 0.5));
+        setInt(space, "height", (int)(sh + 0.5));
+        dset(space, "orientation", NS(sw > sh ? "landscape" : "portrait"));
+    }
+    if (mdc_fixed_screen_size(&fw, &fh) == 0 && fw > 0 && fh > 0) {
+        setInt(space, "fixedWidth", (int)(fw + 0.5));
+        setInt(space, "fixedHeight", (int)(fh + 0.5));
+    }
+    return space;
+}
+
 static int ax_dump_impl(char **out, size_t *outlen, int depth) {
     *out = 0; *outlen = 0;
     if (depth < 1 || depth > MAXDEPTH || ax_init() != 0) return -1;
@@ -908,6 +926,7 @@ static int ax_dump_impl(char **out, size_t *outlen, int depth) {
         setInt(root, "frontmostAvailable", front.has_front);
         setInt(root, "pid", front.pid);
         dset(root, "axBootstrap", axui_bootstrap_status());
+        dset(root, "space", ax_space_status());
         int rc = serialize_json(root, out, outlen);
         if (pool) M_void0(pool, S("drain"));
         return rc;
@@ -923,6 +942,7 @@ static int ax_dump_impl(char **out, size_t *outlen, int depth) {
         setInt(root, "pid", front.pid);
         if (front.bundle[0]) dset(root, "app", NS(front.bundle));
         dset(root, "axBootstrap", axui_bootstrap_status());
+        dset(root, "space", ax_space_status());
         if (app_ref) F_CFRelease(app_ref);
         int rc = serialize_json(root, out, outlen);
         if (pool) M_void0(pool, S("drain"));
@@ -934,6 +954,7 @@ static int ax_dump_impl(char **out, size_t *outlen, int depth) {
     setInt(root, "frontmostAvailable", front.has_front);
     setInt(root, "systemRoot", front.system_root);
     dset(root, "axBootstrap", axui_bootstrap_status());
+    dset(root, "space", ax_space_status());
     OID candidate_diagnostics = M_id0(C("NSMutableDictionary"), S("dictionary"));
     OID tree = 0;
     if (front.system_root) {
@@ -1073,9 +1094,13 @@ int ax_dump(char **out, size_t *outlen, int depth) {
 
 typedef struct {
     const char *needle; /* lowercased query */
-    int score;          /* 0 none, 1 substring, 2 exact */
+    int score;          /* label: 0 none, 1 substring, 2 exact; anchor: 1 visible, 2 fully visible */
     double area;
     double cx, cy;
+    double fx, fy, fw, fh; /* winning frame (label match or viewport anchor) */
+    int anchor;            /* 1 = bottom-most visible labeled element instead of a match */
+    double screen_h;
+    char label[MDC_MAX_TEXT + 1];
     int nodes;
 } AxFindState;
 
@@ -1096,15 +1121,7 @@ static void ax_find_walk(AXRef element, int depth, AxFindState *state) {
         label = M_cstr(value, S("UTF8String"));
 
     if (label && label[0]) {
-        char lower[256];
-        size_t i = 0;
-        for (; label[i] && i < sizeof(lower) - 1; i++)
-            lower[i] = (char)tolower((unsigned char)label[i]);
-        lower[i] = 0;
-        int score = 0;
-        if (!strcmp(lower, state->needle)) score = 2;
-        else if (strstr(lower, state->needle)) score = 1;
-        if (score) {
+        if (state->anchor) {
             AXError frame_error = 0;
             OID frame_value = ax_copy_preferred_attribute(element, 2003, "AXFrame", &frame_error);
             R64 frame;
@@ -1119,12 +1136,53 @@ static void ax_find_walk(AXRef element, int depth, AxFindState *state) {
                 M_void0(frame_value, S("release"));
             }
             if (has_frame && frame.w > 0 && frame.h > 0) {
-                double area = frame.w * frame.h;
-                if (score > state->score || (score == state->score && area < state->area)) {
-                    state->score = score;
-                    state->area = area;
-                    state->cx = frame.x + frame.w / 2.0;
-                    state->cy = frame.y + frame.h / 2.0;
+                int intersects = frame.y < state->screen_h && frame.y + frame.h > 0;
+                int fully = frame.y >= -2 && frame.y + frame.h <= state->screen_h + 2;
+                int small = frame.h <= state->screen_h * 0.4;
+                if (intersects && small && frame.y > state->fy) {
+                    state->fy = frame.y;
+                    state->fx = frame.x;
+                    state->fw = frame.w;
+                    state->fh = frame.h;
+                    state->score = fully ? 2 : 1;
+                    snprintf(state->label, sizeof(state->label), "%s", label);
+                }
+            }
+        } else {
+            char lower[256];
+            size_t i = 0;
+            for (; label[i] && i < sizeof(lower) - 1; i++)
+                lower[i] = (char)tolower((unsigned char)label[i]);
+            lower[i] = 0;
+            int score = 0;
+            if (!strcmp(lower, state->needle)) score = 2;
+            else if (strstr(lower, state->needle)) score = 1;
+            if (score) {
+                AXError frame_error = 0;
+                OID frame_value = ax_copy_preferred_attribute(element, 2003, "AXFrame", &frame_error);
+                R64 frame;
+                bool has_frame = false;
+                if (!frame_error && frame_value) {
+                    if (M_bool1(frame_value, S("isKindOfClass:"), C("NSValue"))) {
+                        frame = M_rect(frame_value, S("CGRectValue"));
+                        has_frame = true;
+                    } else {
+                        has_frame = ax_value_copy_rect((AXRef)frame_value, &frame);
+                    }
+                    M_void0(frame_value, S("release"));
+                }
+                if (has_frame && frame.w > 0 && frame.h > 0) {
+                    double area = frame.w * frame.h;
+                    if (score > state->score || (score == state->score && area < state->area)) {
+                        state->score = score;
+                        state->area = area;
+                        state->cx = frame.x + frame.w / 2.0;
+                        state->cy = frame.y + frame.h / 2.0;
+                        state->fx = frame.x;
+                        state->fy = frame.y;
+                        state->fw = frame.w;
+                        state->fh = frame.h;
+                    }
                 }
             }
         }
@@ -1205,9 +1263,19 @@ typedef struct {
     int done;
     int found;
     int rc;
+    int anchor;
+    double screen_h;
     char label[MDC_MAX_TEXT + 1];
     double cx, cy;
+    double fx, fy, fw, fh;
 } AxFindJob;
+
+typedef struct {
+    int found;
+    char label[MDC_MAX_TEXT + 1];
+    double cx, cy;
+    double fx, fy, fw, fh;
+} AxFindResult;
 
 static void ax_find_walk_root(AxFindJob *job) {
     job->rc = -1;
@@ -1225,6 +1293,9 @@ static void ax_find_walk_root(AxFindJob *job) {
     lower[i] = 0;
     state.needle = lower;
     state.area = 1e18;
+    state.anchor = job->anchor;
+    state.screen_h = job->screen_h;
+    state.fy = -1e18;
 
     AXRef app_ref = make_front_ax_ref(&front);
     if (front.system_root) {
@@ -1257,6 +1328,11 @@ static void ax_find_walk_root(AxFindJob *job) {
         job->found = 1;
         job->cx = state.cx;
         job->cy = state.cy;
+        job->fx = state.fx;
+        job->fy = state.fy;
+        job->fw = state.fw;
+        job->fh = state.fh;
+        if (job->anchor) snprintf(job->label, sizeof(job->label), "%s", state.label);
     }
     job->rc = 0;
 }
@@ -1280,10 +1356,7 @@ static void *ax_find_worker(void *arg) {
     return 0;
 }
 
-/* Returns 0 and fills center coordinates when a label match is found,
- * -2 when nothing matched, -3 when another AX query is in flight. */
-int ax_find_center(const char *label, double *out_x, double *out_y) {
-    if (!label || !label[0] || !out_x || !out_y) return -1;
+static int ax_find_start(void) {
     pthread_mutex_lock(&g_ax_busy_lock);
     if (g_ax_busy) {
         pthread_mutex_unlock(&g_ax_busy_lock);
@@ -1291,19 +1364,31 @@ int ax_find_center(const char *label, double *out_x, double *out_y) {
     }
     g_ax_busy = 1;
     pthread_mutex_unlock(&g_ax_busy_lock);
+    return 0;
+}
 
+static void ax_find_clear_busy(void) {
+    pthread_mutex_lock(&g_ax_busy_lock);
+    g_ax_busy = 0;
+    pthread_mutex_unlock(&g_ax_busy_lock);
+}
+
+static AxFindJob *ax_find_make_job(const char *label, int anchor, double screen_h) {
     AxFindJob *job = calloc(1, sizeof(*job));
-    if (!job) {
-        pthread_mutex_lock(&g_ax_busy_lock);
-        g_ax_busy = 0;
-        pthread_mutex_unlock(&g_ax_busy_lock);
-        return -1;
-    }
+    if (!job) return 0;
     pthread_mutex_init(&job->lock, 0);
     pthread_cond_init(&job->ready, 0);
-    snprintf(job->label, sizeof(job->label), "%s", label);
+    if (label) snprintf(job->label, sizeof(job->label), "%s", label);
+    job->anchor = anchor;
+    job->screen_h = screen_h;
     job->waiter_active = 1;
+    return job;
+}
 
+/* Run the finder and return its result; frees the job on completion. On
+ * timeout the detached worker owns the job. */
+static int ax_find_wait(AxFindJob *job, AxFindResult *out) {
+    if (out) memset(out, 0, sizeof(*out));
     pthread_t worker;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -1311,9 +1396,7 @@ int ax_find_center(const char *label, double *out_x, double *out_y) {
     int create_rc = pthread_create(&worker, &attr, ax_find_worker, job);
     pthread_attr_destroy(&attr);
     if (create_rc != 0) {
-        pthread_mutex_lock(&g_ax_busy_lock);
-        g_ax_busy = 0;
-        pthread_mutex_unlock(&g_ax_busy_lock);
+        ax_find_clear_busy();
         job->waiter_active = 0;
         pthread_cond_destroy(&job->ready);
         pthread_mutex_destroy(&job->lock);
@@ -1330,9 +1413,15 @@ int ax_find_center(const char *label, double *out_x, double *out_y) {
         wait_rc = pthread_cond_timedwait(&job->ready, &job->lock, &deadline);
     if (job->done) {
         int result = job->rc != 0 ? -1 : (job->found ? 0 : -2);
-        if (result == 0) {
-            *out_x = job->cx;
-            *out_y = job->cy;
+        if (out && result == 0) {
+            out->found = 1;
+            out->cx = job->cx;
+            out->cy = job->cy;
+            out->fx = job->fx;
+            out->fy = job->fy;
+            out->fw = job->fw;
+            out->fh = job->fh;
+            snprintf(out->label, sizeof(out->label), "%s", job->label);
         }
         job->waiter_active = 0;
         pthread_mutex_unlock(&job->lock);
@@ -1344,6 +1433,58 @@ int ax_find_center(const char *label, double *out_x, double *out_y) {
     job->waiter_active = 0;
     pthread_mutex_unlock(&job->lock);
     return -4;
+}
+
+static int ax_find_query(const char *label, int anchor, double screen_h, AxFindResult *out) {
+    if (ax_find_start() != 0) return -3;
+    AxFindJob *job = ax_find_make_job(anchor ? 0 : label, anchor, screen_h);
+    if (!job) { ax_find_clear_busy(); return -1; }
+    return ax_find_wait(job, out);
+}
+
+/* Returns 0 and fills center coordinates when a label match is found,
+ * -2 when nothing matched, -3 when another AX query is in flight. */
+int ax_find_center(const char *label, double *out_x, double *out_y) {
+    if (!label || !label[0] || !out_x || !out_y) return -1;
+    AxFindResult result;
+    int rc = ax_find_query(label, 0, 0, &result);
+    if (rc == 0) {
+        *out_x = result.cx;
+        *out_y = result.cy;
+    }
+    return rc;
+}
+
+/* Returns 0 and fills the matched element frame when a label match is found. */
+int ax_find_frame(const char *label, double *x, double *y, double *w, double *h) {
+    if (!label || !label[0] || !x || !y || !w || !h) return -1;
+    AxFindResult result;
+    int rc = ax_find_query(label, 0, 0, &result);
+    if (rc == 0) {
+        *x = result.fx;
+        *y = result.fy;
+        *w = result.fw;
+        *h = result.fh;
+    }
+    return rc;
+}
+
+/* Anchor mode: the bottom-most fully visible labeled element, so callers can
+ * read where the visible content currently sits. */
+int ax_find_anchor(char *label, size_t cap, double *x, double *y, double *w, double *h) {
+    if (!x || !y || !w || !h) return -1;
+    double sw = 0, sh = 0;
+    if (mdc_screen_size(&sw, &sh) != 0 || sw <= 0 || sh <= 0) return -1;
+    AxFindResult result;
+    int rc = ax_find_query(0, 1, sh, &result);
+    if (rc == 0) {
+        *x = result.fx;
+        *y = result.fy;
+        *w = result.fw;
+        *h = result.fh;
+        if (label && cap) snprintf(label, cap, "%s", result.label);
+    }
+    return rc;
 }
 
 /* Frontmost app identity for the `front` command. */

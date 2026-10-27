@@ -42,10 +42,32 @@ static int parse_point(const char *sx, const char *sy, double width, double heig
     return 0;
 }
 
+/* Point without a known target space: the server detects the live screen and
+ * rejects points outside it, so the parser only rejects negatives and absurd
+ * magnitudes here. */
+static int parse_point_auto(const char *sx, const char *sy, double *x, double *y) {
+    if (parse_number(sx, x) || parse_number(sy, y)) return -1;
+    if (*x < 0 || *y < 0 || *x > MDC_MAX_DIMENSION || *y > MDC_MAX_DIMENSION) return -2;
+    return 0;
+}
+
 static int parse_dimensions(const char *sw, const char *sh, double *width, double *height) {
     if (parse_number(sw, width) || parse_number(sh, height)) return -1;
     if (*width <= 0 || *height <= 0 || *width > MDC_MAX_DIMENSION || *height > MDC_MAX_DIMENSION)
         return -1;
+    return 0;
+}
+
+/* --fast (0) or --settle[=MS] (default 1000 ms when MS is omitted). */
+static int parse_settle_flag(const char *token, int *settle_ms) {
+    if (!strcmp(token, "--fast")) { *settle_ms = 0; return 1; }
+    if (!strcmp(token, "--settle")) { *settle_ms = 1000; return 1; }
+    if (!strncmp(token, "--settle=", 9)) {
+        double ms = 0;
+        if (parse_number(token + 9, &ms) || ms < 0 || ms > 10000) return 0;
+        *settle_ms = ms == 0 ? 0 : (int)(ms + 0.5);
+        return 1;
+    }
     return 0;
 }
 
@@ -84,6 +106,8 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
             {"wait", MDC_CMD_WAIT},
             {"toast", MDC_CMD_TOAST},
             {"say", MDC_CMD_SAY},
+            {"scrollto", MDC_CMD_SCROLLTO},
+            {"scrolloffset", MDC_CMD_SCROLLOFFSET},
         };
         for (size_t r = 0; r < sizeof(rest_commands) / sizeof(rest_commands[0]); r++) {
             size_t klen = strlen(rest_commands[r].keyword);
@@ -129,7 +153,8 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
             }
             size_t text_length = strlen(body);
             while (text_length && isspace((unsigned char)body[text_length - 1])) text_length--;
-            if (!text_length) return fail(error, error_size, "invalid-arguments");
+            if (!text_length && rest_commands[r].type != MDC_CMD_SCROLLOFFSET)
+                return fail(error, error_size, "invalid-arguments");
             if (text_length > MDC_MAX_TEXT) return fail(error, error_size, "text-too-long");
             for (size_t i = 0; i < text_length; i++) {
                 if ((unsigned char)body[i] < 0x20 || body[i] == 0x7f)
@@ -140,6 +165,7 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
             memcpy(result.text, body, text_length);
             result.text[text_length] = 0;
             result.type = rest_commands[r].type;
+            if (result.type == MDC_CMD_SCROLLTO) result.settle_ms = 1000;
             result.amount = say_volume;
             memcpy(result.voice, say_voice, sizeof(result.voice));
             result.interruptible = say_interruptible;
@@ -176,10 +202,16 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
         result.type = MDC_CMD_PING;
     } else if (!strcmp(tokens[0], "tap")) {
         if (count != 3 && count != 5) return fail(error, error_size, "invalid-arguments");
-        if (count == 5 && parse_dimensions(tokens[3], tokens[4], &result.width, &result.height))
-            return fail(error, error_size, "invalid-number");
-        int point = parse_point(tokens[1], tokens[2], result.width, result.height,
+        int point = -1;
+        if (count == 5) {
+            if (parse_dimensions(tokens[3], tokens[4], &result.width, &result.height))
+                return fail(error, error_size, "invalid-number");
+            result.has_dimensions = 1;
+            point = parse_point(tokens[1], tokens[2], result.width, result.height,
                                 &result.x1, &result.y1);
+        } else {
+            point = parse_point_auto(tokens[1], tokens[2], &result.x1, &result.y1);
+        }
         if (point == -1) return fail(error, error_size, "invalid-number");
         if (point == -2) return fail(error, error_size, "out-of-bounds");
         result.type = MDC_CMD_TAP;
@@ -189,14 +221,26 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
             if (parse_int(tokens[5], &result.steps) || result.steps > MDC_MAX_SWIPE_STEPS)
                 return fail(error, error_size, "invalid-steps");
         }
-        if (count == 8 && parse_dimensions(tokens[6], tokens[7], &result.width, &result.height))
-            return fail(error, error_size, "invalid-number");
-        int point = parse_point(tokens[1], tokens[2], result.width, result.height,
+        if (count == 8) {
+            if (parse_dimensions(tokens[6], tokens[7], &result.width, &result.height))
+                return fail(error, error_size, "invalid-number");
+            result.has_dimensions = 1;
+        }
+        int point = -1;
+        if (result.has_dimensions) {
+            point = parse_point(tokens[1], tokens[2], result.width, result.height,
                                 &result.x1, &result.y1);
+        } else {
+            point = parse_point_auto(tokens[1], tokens[2], &result.x1, &result.y1);
+        }
         if (point == -1) return fail(error, error_size, "invalid-number");
         if (point == -2) return fail(error, error_size, "out-of-bounds");
-        point = parse_point(tokens[3], tokens[4], result.width, result.height,
-                            &result.x2, &result.y2);
+        if (result.has_dimensions) {
+            point = parse_point(tokens[3], tokens[4], result.width, result.height,
+                                &result.x2, &result.y2);
+        } else {
+            point = parse_point_auto(tokens[3], tokens[4], &result.x2, &result.y2);
+        }
         if (point == -1) return fail(error, error_size, "invalid-number");
         if (point == -2) return fail(error, error_size, "out-of-bounds");
         result.type = MDC_CMD_SWIPE;
@@ -295,11 +339,19 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
         } else if (is_longpress && count == 5) {
             dims_at = 3;
         }
-        if (dims_at > 0 && parse_dimensions(tokens[dims_at], tokens[dims_at + 1],
-                                            &result.width, &result.height))
-            return fail(error, error_size, "invalid-number");
-        int point = parse_point(tokens[1], tokens[2], result.width, result.height,
+        if (dims_at > 0) {
+            if (parse_dimensions(tokens[dims_at], tokens[dims_at + 1],
+                                 &result.width, &result.height))
+                return fail(error, error_size, "invalid-number");
+            result.has_dimensions = 1;
+        }
+        int point = -1;
+        if (result.has_dimensions) {
+            point = parse_point(tokens[1], tokens[2], result.width, result.height,
                                 &result.x1, &result.y1);
+        } else {
+            point = parse_point_auto(tokens[1], tokens[2], &result.x1, &result.y1);
+        }
         if (point == -1) return fail(error, error_size, "invalid-number");
         if (point == -2) return fail(error, error_size, "out-of-bounds");
         result.type = is_longpress ? MDC_CMD_LONGPRESS : MDC_CMD_DOUBLETAP;
@@ -318,14 +370,26 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
             if (parse_int(tokens[6], &result.steps) || result.steps > MDC_MAX_SWIPE_STEPS)
                 return fail(error, error_size, "invalid-steps");
         }
-        if (count == 9 && parse_dimensions(tokens[7], tokens[8], &result.width, &result.height))
-            return fail(error, error_size, "invalid-number");
-        int point = parse_point(tokens[1], tokens[2], result.width, result.height,
+        if (count == 9) {
+            if (parse_dimensions(tokens[7], tokens[8], &result.width, &result.height))
+                return fail(error, error_size, "invalid-number");
+            result.has_dimensions = 1;
+        }
+        int point = -1;
+        if (result.has_dimensions) {
+            point = parse_point(tokens[1], tokens[2], result.width, result.height,
                                 &result.x1, &result.y1);
+        } else {
+            point = parse_point_auto(tokens[1], tokens[2], &result.x1, &result.y1);
+        }
         if (point == -1) return fail(error, error_size, "invalid-number");
         if (point == -2) return fail(error, error_size, "out-of-bounds");
-        point = parse_point(tokens[3], tokens[4], result.width, result.height,
-                            &result.x2, &result.y2);
+        if (result.has_dimensions) {
+            point = parse_point(tokens[3], tokens[4], result.width, result.height,
+                                &result.x2, &result.y2);
+        } else {
+            point = parse_point_auto(tokens[3], tokens[4], &result.x2, &result.y2);
+        }
         if (point == -1) return fail(error, error_size, "invalid-number");
         if (point == -2) return fail(error, error_size, "out-of-bounds");
         result.type = MDC_CMD_DRAG;
@@ -396,23 +460,50 @@ int mdc_parse_line(const char *line, MdcCommand *out, char *error, unsigned long
         if (count != 1) return fail(error, error_size, "invalid-arguments");
         result.type = MDC_CMD_WAKE;
     } else if (!strcmp(tokens[0], "scroll")) {
-        /* scroll up|down|left|right [POINTS] [W H] */
-        if (count != 2 && count != 3 && count != 5)
-            return fail(error, error_size, "invalid-arguments");
+        /* scroll up|down|left|right [POINTS] [W H] [--settle[=MS]|--fast] */
+        if (count < 2 || count > 6) return fail(error, error_size, "invalid-arguments");
         if (!strcmp(tokens[1], "up")) result.direction = 0;
         else if (!strcmp(tokens[1], "down")) result.direction = 1;
         else if (!strcmp(tokens[1], "left")) result.direction = 2;
         else if (!strcmp(tokens[1], "right")) result.direction = 3;
         else return fail(error, error_size, "invalid-direction");
-        if (count >= 3) {
+        result.settle_ms = 1000;
+        size_t index = 2;
+        if (index < count) {
             double amount = 0;
-            if (parse_number(tokens[2], &amount) || amount <= 0 || amount > MDC_MAX_DIMENSION)
-                return fail(error, error_size, "invalid-amount");
-            result.amount = amount;
+            if (parse_number(tokens[index], &amount) == 0) {
+                if (amount <= 0 || amount > MDC_MAX_DIMENSION)
+                    return fail(error, error_size, "invalid-amount");
+                result.amount = amount;
+                index++;
+            }
         }
-        if (count == 5 && parse_dimensions(tokens[3], tokens[4], &result.width, &result.height))
-            return fail(error, error_size, "invalid-number");
+        if (index + 1 < count) {
+            double probe = 0;
+            if (parse_number(tokens[index], &probe) == 0) {
+                if (parse_dimensions(tokens[index], tokens[index + 1],
+                                     &result.width, &result.height))
+                    return fail(error, error_size, "invalid-number");
+                result.has_dimensions = 1;
+                index += 2;
+            }
+        }
+        while (index < count) {
+            if (!parse_settle_flag(tokens[index], &result.settle_ms))
+                return fail(error, error_size, "invalid-arguments");
+            index++;
+        }
         result.type = MDC_CMD_SCROLL;
+    } else if (!strcmp(tokens[0], "scrolltop") || !strcmp(tokens[0], "scrollbottom")) {
+        /* scrolltop|scrollbottom [--settle[=MS]|--fast] */
+        if (count > 2) return fail(error, error_size, "invalid-arguments");
+        result.settle_ms = 1000;
+        if (count == 2 && !parse_settle_flag(tokens[1], &result.settle_ms))
+            return fail(error, error_size, "invalid-arguments");
+        result.type = !strcmp(tokens[0], "scrolltop") ? MDC_CMD_SCROLLTOP : MDC_CMD_SCROLLBOTTOM;
+    } else if (!strcmp(tokens[0], "size")) {
+        if (count != 1) return fail(error, error_size, "invalid-arguments");
+        result.type = MDC_CMD_SIZE;
     } else if (!strcmp(tokens[0], "unlock")) {
         if (count > 2) return fail(error, error_size, "invalid-arguments");
         if (count == 2) {

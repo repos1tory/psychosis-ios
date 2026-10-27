@@ -1,5 +1,5 @@
 // mdc_services.c - notify (UserNotifications) and shot (display capture) for
-// the Psychosis/MDControl SpringBoard dylib. All framework access is dynamic
+// the Psychosis SpringBoard dylib. All framework access is dynamic
 // (dlopen + dlsym + raw Objective-C runtime) so nothing needs to be linked.
 #include "mdc_services.h"
 #include "mdc_mainthread.h"

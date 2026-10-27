@@ -1,6 +1,6 @@
 Package: com.alsinas.psychosis
 Name: Psychosis
-Version: 0.6.0
+Version: 0.7.1
 Architecture: iphoneos-arm64
 Description: System-wide touch/key injection and accessibility automation server for agent control (localhost:6001), on device and remote
 Maintainer: alsinas

@@ -1,11 +1,13 @@
-Package: com.alsinas.mdcontrol
-Name: MDControl
-Version: 0.4.21
+Package: com.alsinas.psychosis
+Name: Psychosis
+Version: 0.7.1
 Architecture: iphoneos-arm64
 Description: System-wide touch/key injection and accessibility automation server for agent control (localhost:6001)
 Maintainer: alsinas
 Author: alsinas
 Section: Tweaks
 Depends: ellekit (>= 1.2), firmware (>= 15.0)
+Replaces: com.alsinas.mdcontrol
+Conflicts: com.alsinas.mdcontrol
 Priority: optional
 Installed-Size: 60

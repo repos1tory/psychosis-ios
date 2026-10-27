@@ -1,6 +1,8 @@
-# MDControl
+# Psychosis
 
-MDControl is a rootless iOS automation tweak and on-device CLI. The tweak runs in SpringBoard and binds its line protocol to `127.0.0.1:6001`; host automation reaches it by SSH and runs `mdctl` on the device. The server is not exposed on the LAN.
+Psychosis is a rootless iOS automation tweak and on-device CLI. The tweak runs in SpringBoard and binds its line protocol to `127.0.0.1:6001`; host automation reaches it by SSH and runs `psychosis` on the device. The server is not exposed on the LAN.
+
+The short command is **`psi`** — **P**sychosis **S**ystem **I**nterface, also evoking the Greek letter ψ. Both names run the same executable, with identical arguments and exit codes.
 
 ## Protocol
 
@@ -34,28 +36,44 @@ tests/run-unit.sh
 
 The suite checks command forms, defaults, strict numeric parsing, coordinate bounds, swipe step limits, bundle IDs, AX depth, bounded text input, and overlong lines.
 
+## Autonomous AI QA prompt
+
+`docs/AI_AUTOMATION_TEST_PROMPT.md` contains a reusable prompt for an agent to
+enumerate and test every parser, CLI, SpringBoard, AX, HID, and Lens workflow.
+It includes a safety gate for chat sending, settings changes, microphone/camera
+access, clipboard mutation, and other destructive actions. The prompt requires
+an explicit Lens bundle ID and disposable fixture before Lens-specific or
+authorized chat-flow tests are run.
+
 ## Build and install on the iPad
 
 Copy the project to the device or edit its existing checkout, then run:
 
 ```sh
-cd /var/mobile/Downloads/MDControl
+cd /path/to/Projects/psychosis
 ./build.sh
-sudo dpkg -i com.alsinas.mdcontrol_0.4.28_iphoneos-arm64.deb
-sudo sbreload
+sudo dpkg -i com.alsinas.psychosis_0.7.1_iphoneos-arm64.deb
+# Only when a SpringBoard reload is authorized:
+# sudo sbreload
 ```
 
-`build.sh` builds the SpringBoard dylib and `mdctl`, packages the SpringBoard filter plist, and installs the CLI at `/var/jb/usr/bin/mdctl`. A SpringBoard reload is needed for the new dylib to load. Keep the prior package before installing. The original 0.2.0 package can be restored with `sudo dpkg -i com.alsinas.mdcontrol_0.2.0_iphoneos-arm64.deb && sudo sbreload`.
+`build.sh` builds the SpringBoard dylib and `psychosis`, packages the SpringBoard filter plist, and stages the CLI at `/var/jb/usr/bin/psychosis` with `psi` as a symlink. Installing the package replaces the retired CLI alias. A separately authorized SpringBoard reload is needed for the new dylib to load; building or installing alone does not reload it. Keep the prior package for rollback. Historical package identifiers remain only in Debian migration metadata and archived build artifacts.
+
+After building, run `sh tests/run-branding.sh` to check both command names and package branding without dispatching device input.
 
 ## On-device smoke suite
 
 After installing and reloading SpringBoard, run from the host:
 
 ```sh
-python3 tests/device_smoke.py
+node tests/device_issues_test.mjs
 ```
 
-The default target is `mobile@10.0.0.33` and identity `~/.ssh/codex-ipad-10.0.0.33`. Override them with `--target` and `--identity`. The smoke run launches Settings, taps General using its AX frame, checks the About row, performs a bounded swipe and checks AX again, returns Home, launches Clock, and returns Home. It only uses navigation and does not change settings, submit forms, or access app content. AX trees are parsed in memory; the JSON report contains only step status and observed bundle IDs, never the raw tree or element values. The report defaults to `artifacts/last-device-smoke.json`.
+The device regression launches safe read-only web content and checks coordinate
+space, AX-frame tapping, scrolling, and settled navigation. Configure its
+`PSY_*` environment variables for a fixture URL and labels. It does not submit
+forms or send chat messages. Its report contains step status and observed
+bundle IDs, never raw AX trees or element values.
 
 ## Error codes
 

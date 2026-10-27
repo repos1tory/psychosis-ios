@@ -36,13 +36,25 @@ typedef enum {
     MDC_CMD_CLIPBOARD_GET,
     MDC_CMD_CLIPBOARD_SET,
     MDC_CMD_KEY,
-    MDC_CMD_OPEN_URL
+    MDC_CMD_OPEN_URL,
+    MDC_CMD_SIZE,
+    MDC_CMD_SCROLLTO,
+    MDC_CMD_SCROLLTOP,
+    MDC_CMD_SCROLLBOTTOM,
+    MDC_CMD_SCROLLOFFSET
 } MdcCommandType;
 
 typedef struct {
     MdcCommandType type;
     double x1, y1, x2, y2;
     double width, height;
+    /* 1 when the caller passed an explicit W H. Without it, coordinate
+     * commands interpret X Y in the device's detected current screen space
+     * (the same space ax frames use). */
+    int has_dimensions;
+    /* SCROLL/SCROLLTOP/SCROLLBOTTOM/SCROLLTO: how long to wait for layout to
+     * settle before answering, in ms. 1000 default, 0 = off (--fast). */
+    int settle_ms;
     int steps;
     int depth;
     int direction; /* SCROLL: 0 up, 1 down, 2 left, 3 right */

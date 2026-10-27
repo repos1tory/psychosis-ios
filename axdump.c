@@ -210,12 +210,12 @@ static void ax_log(const char *fmt, ...) {
     if (n <= 0) return;
     size_t len = (size_t)n < sizeof(line) - 2 ? (size_t)n : sizeof(line) - 2;
     line[len++] = '\n';
-    int fd = open("/var/mobile/Library/Logs/MDControl-ax.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int fd = open("/var/mobile/Library/Logs/Psychosis-ax.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd >= 0) { (void)write(fd, line, len); close(fd); }
 }
 
 static void ax_log_reset(void) {
-    int fd = open("/var/mobile/Library/Logs/MDControl-ax.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    int fd = open("/var/mobile/Library/Logs/Psychosis-ax.log", O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) close(fd);
 }
 

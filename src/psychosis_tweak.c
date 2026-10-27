@@ -1,4 +1,4 @@
-// MDControl.dylib - system-wide input server, runs inside SpringBoard.
+// Psychosis.dylib - system-wide input server, runs inside SpringBoard.
 // No hooks, no private headers: constructor starts a localhost TCP server,
 // dispatches HID events from SpringBoard context (Veency-proven path).
 // Protocol (one bounded, newline-terminated request per connection):
@@ -6,10 +6,12 @@
 //   home | volup | launch BUNDLE_ID | ax [depth]
 #include <dlfcn.h>
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -23,6 +25,8 @@
 #include "mdc_keymap.h"
 
 int ax_find_center(const char *label, double *out_x, double *out_y);
+int ax_find_frame(const char *label, double *x, double *y, double *w, double *h);
+int ax_find_anchor(char *label, size_t cap, double *x, double *y, double *w, double *h);
 int ax_front_info(char *bundle, size_t cap, int *pid, int *system_root);
 
 typedef void *CFRef;
@@ -490,7 +494,7 @@ static void startup_log(const char *stage, int value) {
     char line[128];
     int n = snprintf(line, sizeof(line), "%s %d\n", stage, value);
     if (n <= 0 || (size_t)n >= sizeof(line)) return;
-    int fd = open("/var/mobile/Library/Logs/MDControl-startup.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int fd = open("/var/mobile/Library/Logs/Psychosis-startup.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd >= 0) { write(fd, line, (size_t)n); close(fd); }
 }
 
@@ -520,6 +524,117 @@ static int send_all(int fd, const char *p, size_t n) {
     }
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Coordinate spaces and deterministic scrolling helpers               */
+/* ------------------------------------------------------------------ */
+
+/* Input space for a coordinate command: the explicit W H when the caller
+ * passed one, otherwise the device's live current screen space -- the same
+ * space ax frames use. An explicit W H describes the input space only;
+ * points are stretched proportionally onto the live screen and rotated into
+ * the fixed space HID expects. */
+static int resolve_space(const MdcCommand *cmd, double *out_w, double *out_h) {
+    if (cmd->has_dimensions) {
+        if (cmd->width <= 0 || cmd->height <= 0) return -1;
+        *out_w = cmd->width;
+        *out_h = cmd->height;
+        return 0;
+    }
+    if (mdc_screen_size(out_w, out_h) != 0) return -1;
+    if (*out_w <= 0 || *out_h <= 0) return -1;
+    return 0;
+}
+
+static int point_in_space(double x, double y, double w, double h) {
+    return x >= 0 && y >= 0 && x < w && y < h;
+}
+
+static uint64_t mdc_hash_bytes(const char *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned char)p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Hash of the front app's AX root subtree; a changed hash means labels or
+ * frames moved. Returns -1 when AX is unavailable. */
+static int ax_content_signature(uint64_t *out) {
+    *out = 0;
+    char *js = 0;
+    size_t jl = 0;
+    int rc = ax_dump(&js, &jl, 6);
+    if (rc != 0 || !js || !jl) { if (js) free(js); return -1; }
+    const char *root = strstr(js, "\"root\":");
+    if (!root) root = js;
+    *out = mdc_hash_bytes(root, jl - (size_t)(root - js));
+    free(js);
+    return 0;
+}
+
+static long mdc_ms_since(const struct timespec *start) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - start->tv_sec) * 1000 + (now.tv_nsec - start->tv_nsec) / 1000000;
+}
+
+/* Wait until the AX tree stops changing (two equal signatures in a row) or
+ * cap_ms passes. Async layouts settle here, so callers can read fresh frames
+ * the moment scrolling returns. */
+static void ax_wait_settled(int cap_ms) {
+    if (cap_ms <= 0) return;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t previous = 0;
+    int have_previous = 0;
+    int first = 1;
+    for (;;) {
+        long elapsed = mdc_ms_since(&start);
+        if (elapsed >= cap_ms) break;
+        long wait = first ? 180 : 140;
+        if (elapsed + wait > cap_ms) wait = cap_ms - elapsed;
+        usleep((useconds_t)(wait * 1000));
+        first = 0;
+        uint64_t signature = 0;
+        if (ax_content_signature(&signature) == 0 && signature) {
+            if (have_previous && signature == previous) return;
+            previous = signature;
+            have_previous = 1;
+        }
+    }
+    if (!have_previous) usleep(150000); /* AX unavailable: fixed fallback */
+}
+
+/* Press-drag-release in the caller's space. The trailing stationary move
+ * events give the pan recognizer zero velocity at liftoff, so scroll views
+ * stop precisely instead of gliding on. */
+static int scroll_gesture(double x1, double y1, double x2, double y2,
+                          double w, double h, int *out_steps) {
+    double nx1 = 0, ny1 = 0, nx2 = 0, ny2 = 0;
+    if (mdc_normalize_hid_point(x1, y1, w, h, &nx1, &ny1) != 0) { nx1 = x1 / w; ny1 = y1 / h; }
+    if (mdc_normalize_hid_point(x2, y2, w, h, &nx2, &ny2) != 0) { nx2 = x2 / w; ny2 = y2 / h; }
+    double dx = x2 - x1, dy = y2 - y1;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+    double distance = dx > dy ? dx : dy;
+    int steps = (int)(distance / 25.0);
+    if (steps < 12) steps = 12;
+    if (steps > 40) steps = 40;
+    if (send_phase(0, nx1, ny1) != 0) return -1;
+    usleep(25000);
+    for (int i = 1; i <= steps; i++) {
+        if (send_phase(1, nx1 + (nx2 - nx1) * i / steps,
+                       ny1 + (ny2 - ny1) * i / steps) != 0) return -1;
+        usleep(22000);
+    }
+    for (int i = 0; i < 3; i++) { /* kill inertial momentum before liftoff */
+        usleep(50000);
+        if (send_phase(1, nx2, ny2) != 0) return -1;
+    }
+    if (send_phase(2, nx2, ny2) != 0) return -1;
+    if (out_steps) *out_steps = steps;
+    return 0;
+}
+
 static int dispatch_tap(double tx, double ty, double tw, double th, char *resp, size_t rsz) {
     if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return -1; }
     int marker_shown = mdc_show_tap(tx, ty, tw, th);
@@ -537,15 +652,27 @@ static int dispatch_tap(double tx, double ty, double tw, double th, char *resp, 
 static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
     if (cmd->type == MDC_CMD_PING) { snprintf(resp, rsz, "ok pong\n"); return; }
     if (cmd->type == MDC_CMD_TAP) {
-        dispatch_tap(cmd->x1, cmd->y1, cmd->width, cmd->height, resp, rsz);
+        double sw = 0, sh = 0;
+        if (resolve_space(cmd, &sw, &sh) != 0) {
+            snprintf(resp, rsz, "err screen-size-unavailable\n");
+            return;
+        }
+        if (!point_in_space(cmd->x1, cmd->y1, sw, sh)) {
+            snprintf(resp, rsz, "err out-of-bounds\n");
+            return;
+        }
+        dispatch_tap(cmd->x1, cmd->y1, sw, sh, resp, rsz);
         return;
     }
     if (cmd->type == MDC_CMD_LONGPRESS) {
         if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
-        int marker_shown = mdc_show_tap(cmd->x1, cmd->y1, cmd->width, cmd->height);
+        double sw = 0, sh = 0;
+        if (resolve_space(cmd, &sw, &sh) != 0) { snprintf(resp, rsz, "err screen-size-unavailable\n"); return; }
+        if (!point_in_space(cmd->x1, cmd->y1, sw, sh)) { snprintf(resp, rsz, "err out-of-bounds\n"); return; }
+        int marker_shown = mdc_show_tap(cmd->x1, cmd->y1, sw, sh);
         double x = 0, y = 0;
-        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, cmd->width, cmd->height, &x, &y) != 0) {
-            x = cmd->x1 / cmd->width; y = cmd->y1 / cmd->height;
+        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, sw, sh, &x, &y) != 0) {
+            x = cmd->x1 / sw; y = cmd->y1 / sh;
         }
         if (send_phase(0, x, y) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
         usleep((useconds_t)(cmd->hold_ms * 1000));
@@ -555,10 +682,13 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
     }
     if (cmd->type == MDC_CMD_DOUBLETAP) {
         if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
-        int marker_shown = mdc_show_tap(cmd->x1, cmd->y1, cmd->width, cmd->height);
+        double sw = 0, sh = 0;
+        if (resolve_space(cmd, &sw, &sh) != 0) { snprintf(resp, rsz, "err screen-size-unavailable\n"); return; }
+        if (!point_in_space(cmd->x1, cmd->y1, sw, sh)) { snprintf(resp, rsz, "err out-of-bounds\n"); return; }
+        int marker_shown = mdc_show_tap(cmd->x1, cmd->y1, sw, sh);
         double x = 0, y = 0;
-        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, cmd->width, cmd->height, &x, &y) != 0) {
-            x = cmd->x1 / cmd->width; y = cmd->y1 / cmd->height;
+        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, sw, sh, &x, &y) != 0) {
+            x = cmd->x1 / sw; y = cmd->y1 / sh;
         }
         for (int i = 0; i < 2; i++) {
             if (send_phase(0, x, y) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
@@ -571,13 +701,20 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
     }
     if (cmd->type == MDC_CMD_DRAG) {
         if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
-        int marker_start = mdc_show_tap(cmd->x1, cmd->y1, cmd->width, cmd->height);
-        double nx1 = 0, ny1 = 0, nx2 = 0, ny2 = 0;
-        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, cmd->width, cmd->height, &nx1, &ny1) != 0) {
-            nx1 = cmd->x1 / cmd->width; ny1 = cmd->y1 / cmd->height;
+        double sw = 0, sh = 0;
+        if (resolve_space(cmd, &sw, &sh) != 0) { snprintf(resp, rsz, "err screen-size-unavailable\n"); return; }
+        if (!point_in_space(cmd->x1, cmd->y1, sw, sh) ||
+            !point_in_space(cmd->x2, cmd->y2, sw, sh)) {
+            snprintf(resp, rsz, "err out-of-bounds\n");
+            return;
         }
-        if (mdc_normalize_hid_point(cmd->x2, cmd->y2, cmd->width, cmd->height, &nx2, &ny2) != 0) {
-            nx2 = cmd->x2 / cmd->width; ny2 = cmd->y2 / cmd->height;
+        int marker_start = mdc_show_tap(cmd->x1, cmd->y1, sw, sh);
+        double nx1 = 0, ny1 = 0, nx2 = 0, ny2 = 0;
+        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, sw, sh, &nx1, &ny1) != 0) {
+            nx1 = cmd->x1 / sw; ny1 = cmd->y1 / sh;
+        }
+        if (mdc_normalize_hid_point(cmd->x2, cmd->y2, sw, sh, &nx2, &ny2) != 0) {
+            nx2 = cmd->x2 / sw; ny2 = cmd->y2 / sh;
         }
         if (send_phase(0, nx1, ny1) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
         usleep((useconds_t)(cmd->hold_ms * 1000)); /* pick-up hold: no movement */
@@ -591,7 +728,7 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
         }
         usleep(120000); /* settle before release */
         if (send_phase(2, nx2, ny2) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
-        int marker_end = mdc_show_tap(cmd->x2, cmd->y2, cmd->width, cmd->height);
+        int marker_end = mdc_show_tap(cmd->x2, cmd->y2, sw, sh);
         snprintf(resp, rsz,
                  marker_start || marker_end ? "ok drag visible\n" : "ok drag marker-unavailable\n");
         return;
@@ -618,13 +755,20 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
     }
     if (cmd->type == MDC_CMD_SWIPE) {
         if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
-        int marker_start = mdc_show_tap(cmd->x1, cmd->y1, cmd->width, cmd->height);
-        double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, cmd->width, cmd->height, &x1, &y1) != 0) {
-            x1 = cmd->x1 / cmd->width; y1 = cmd->y1 / cmd->height;
+        double sw = 0, sh = 0;
+        if (resolve_space(cmd, &sw, &sh) != 0) { snprintf(resp, rsz, "err screen-size-unavailable\n"); return; }
+        if (!point_in_space(cmd->x1, cmd->y1, sw, sh) ||
+            !point_in_space(cmd->x2, cmd->y2, sw, sh)) {
+            snprintf(resp, rsz, "err out-of-bounds\n");
+            return;
         }
-        if (mdc_normalize_hid_point(cmd->x2, cmd->y2, cmd->width, cmd->height, &x2, &y2) != 0) {
-            x2 = cmd->x2 / cmd->width; y2 = cmd->y2 / cmd->height;
+        int marker_start = mdc_show_tap(cmd->x1, cmd->y1, sw, sh);
+        double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        if (mdc_normalize_hid_point(cmd->x1, cmd->y1, sw, sh, &x1, &y1) != 0) {
+            x1 = cmd->x1 / sw; y1 = cmd->y1 / sh;
+        }
+        if (mdc_normalize_hid_point(cmd->x2, cmd->y2, sw, sh, &x2, &y2) != 0) {
+            x2 = cmd->x2 / sw; y2 = cmd->y2 / sh;
         }
         if (send_phase(0, x1, y1) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
         usleep(20000);
@@ -636,7 +780,7 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
             usleep(15000);
         }
         if (send_phase(2, x2, y2) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
-        int marker_end = mdc_show_tap(cmd->x2, cmd->y2, cmd->width, cmd->height);
+        int marker_end = mdc_show_tap(cmd->x2, cmd->y2, sw, sh);
         snprintf(resp, rsz, marker_start || marker_end ? "ok swipe visible\n" : "ok swipe marker-unavailable\n"); return;
     }
     if (cmd->type == MDC_CMD_HOME || cmd->type == MDC_CMD_VOLUP) {
@@ -719,21 +863,21 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
         if (found == -3) { snprintf(resp, rsz, "err ax-busy\n"); return; }
         if (found != 0) { snprintf(resp, rsz, "err not-found\n"); return; }
         if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
-        /* AX frames are fixed-coordinate-space points; HID wants normalized
-         * fixed-space coordinates, and the marker wants current-space. */
-        double fx = 0, fy = 0;
-        if (mdc_fixed_screen_size(&fx, &fy) != 0 || fx <= 0 || fy <= 0) {
+        /* ax frames and tap coordinates share the live current screen space;
+         * HID then wants normalized fixed-space coordinates. */
+        double sw = 0, sh = 0;
+        if (mdc_screen_size(&sw, &sh) != 0 || sw <= 0 || sh <= 0) {
             snprintf(resp, rsz, "err screen-size-unavailable\n"); return;
         }
-        double nx = tx / fx, ny = ty / fy;
+        double nx = 0, ny = 0;
+        if (mdc_normalize_hid_point(tx, ty, sw, sh, &nx, &ny) != 0) {
+            nx = tx / sw; ny = ty / sh;
+        }
         if (nx < 0) nx = 0;
         if (nx > 1) nx = 1;
         if (ny < 0) ny = 0;
         if (ny > 1) ny = 1;
-        int marker_shown = 0;
-        double cx = tx, cy = ty, cw = 0, ch = 0;
-        if (mdc_fixed_to_current(tx, ty, &cx, &cy) == 0 && mdc_screen_size(&cw, &ch) == 0)
-            marker_shown = mdc_show_tap(cx, cy, cw, ch);
+        int marker_shown = mdc_show_tap(tx, ty, sw, sh);
         if (send_phase(0, nx, ny) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
         usleep(60000);
         if (send_phase(2, nx, ny) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
@@ -756,11 +900,12 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
                 if (found == -2) { snprintf(resp, rsz, "ok gone\n"); return; }
                 if (found == -1) { snprintf(resp, rsz, "err ax-unavailable\n"); return; }
             } else if (found == 0) {
-                double cx = tx, cy = ty, cw = 0, ch = 0;
-                if (mdc_fixed_to_current(tx, ty, &cx, &cy) == 0 &&
-                    mdc_screen_size(&cw, &ch) == 0)
+                /* ax frames are already in the live current screen space, the
+                 * same space tap defaults to. */
+                double cw = 0, ch = 0;
+                if (mdc_screen_size(&cw, &ch) == 0)
                     snprintf(resp, rsz, "ok found %d %d %d %d\n",
-                             (int)cx, (int)cy, (int)cw, (int)ch);
+                             (int)tx, (int)ty, (int)cw, (int)ch);
                 else
                     snprintf(resp, rsz, "ok found %d %d\n", (int)tx, (int)ty);
                 return;
@@ -789,54 +934,197 @@ static void run_command(const MdcCommand *cmd, char *resp, size_t rsz) {
         do_unlock(cmd->text, resp, rsz);
         return;
     }
+    if (cmd->type == MDC_CMD_SIZE) {
+        double sw = 0, sh = 0, fw = 0, fh = 0;
+        if (mdc_screen_size(&sw, &sh) != 0 || sw <= 0 || sh <= 0) {
+            snprintf(resp, rsz, "err screen-size-unavailable\n");
+            return;
+        }
+        if (mdc_fixed_screen_size(&fw, &fh) != 0) { fw = 0; fh = 0; }
+        snprintf(resp, rsz, "ok %d %d %d %d\n",
+                 (int)(sw + 0.5), (int)(sh + 0.5), (int)(fw + 0.5), (int)(fh + 0.5));
+        return;
+    }
+    if (cmd->type == MDC_CMD_SCROLLOFFSET) {
+        if (cmd->text[0]) {
+            double x = 0, y = 0, w = 0, h = 0;
+            int found = ax_find_frame(cmd->text, &x, &y, &w, &h);
+            if (found == -3) { snprintf(resp, rsz, "err ax-busy\n"); return; }
+            if (found == -1) { snprintf(resp, rsz, "err ax-unavailable\n"); return; }
+            if (found != 0) { snprintf(resp, rsz, "err not-found\n"); return; }
+            snprintf(resp, rsz, "ok offset %d %d %d %d\n", (int)x, (int)y, (int)w, (int)h);
+        } else {
+            char label[MDC_MAX_TEXT + 1];
+            double x = 0, y = 0, w = 0, h = 0;
+            memset(label, 0, sizeof(label));
+            int found = ax_find_anchor(label, sizeof(label), &x, &y, &w, &h);
+            if (found == -3) { snprintf(resp, rsz, "err ax-busy\n"); return; }
+            if (found == -1) { snprintf(resp, rsz, "err ax-unavailable\n"); return; }
+            if (found != 0) { snprintf(resp, rsz, "err not-found\n"); return; }
+            snprintf(resp, rsz, "ok offset %d %d %d %d %s\n",
+                     (int)x, (int)y, (int)w, (int)h, label);
+        }
+        return;
+    }
     if (cmd->type == MDC_CMD_SCROLL) {
         if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
-        double sw = cmd->width, sh = cmd->height;
-        double amount = cmd->amount;
-        /* default: 60% of the axis the gesture travels along */
-        if (amount <= 0) amount = (cmd->direction <= 1 ? sh : sw) * 0.6;
-        double max_along = (cmd->direction <= 1 ? sh : sw) * 0.84;
-        if (amount > max_along) amount = max_along;
-        double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-        /* finger travels opposite the content direction:
-         * scroll down = finger up, scroll up = finger down, etc. */
-        if (cmd->direction == 0) {        /* up: content moves down */
-            x1 = sw / 2; y1 = sh * 0.28; x2 = sw / 2; y2 = y1 + amount;
-        } else if (cmd->direction == 1) { /* down: content moves up */
-            x1 = sw / 2; y1 = sh * 0.72; x2 = sw / 2; y2 = y1 - amount;
-        } else if (cmd->direction == 2) { /* left: content moves right */
-            x1 = sw * 0.28; y1 = sh / 2; x2 = x1 + amount; y2 = sh / 2;
-        } else {                          /* right: content moves left */
-            x1 = sw * 0.72; y1 = sh / 2; x2 = x1 - amount; y2 = sh / 2;
+        double sw = 0, sh = 0;
+        if (resolve_space(cmd, &sw, &sh) != 0) {
+            snprintf(resp, rsz, "err screen-size-unavailable\n");
+            return;
         }
-        if (y2 < sh * 0.08) y2 = sh * 0.08;
-        if (y2 > sh * 0.92) y2 = sh * 0.92;
-        if (x2 < sw * 0.08) x2 = sw * 0.08;
-        if (x2 > sw * 0.92) x2 = sw * 0.92;
+        int vertical = cmd->direction <= 1;
+        double axis = vertical ? sh : sw;
+        double amount = cmd->amount > 0 ? cmd->amount : axis * 0.6;
+        double max_step = axis * 0.64; /* gesture travel that fits on screen */
+        int settle_ms = cmd->settle_ms;
+        int total_steps = 0;
+        int markers = 0;
+        int gestures = 0;
+        uint64_t before_signature = 0;
+        int have_signature = 0;
+        if (amount > max_step && settle_ms > 0 &&
+            ax_content_signature(&before_signature) == 0)
+            have_signature = 1;
+        double remaining = amount;
+        while (remaining > 0.5 && gestures < 24) {
+            double step = remaining > max_step ? max_step : remaining;
+            double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            /* finger travels opposite the content direction:
+             * scroll down = finger up, scroll up = finger down, etc. */
+            if (cmd->direction == 0) {        /* up: content moves down */
+                x1 = sw / 2; y1 = sh * 0.28; x2 = x1; y2 = y1 + step;
+            } else if (cmd->direction == 1) { /* down: content moves up */
+                x1 = sw / 2; y1 = sh * 0.72; x2 = x1; y2 = y1 - step;
+            } else if (cmd->direction == 2) { /* left: content moves right */
+                x1 = sw * 0.28; y1 = sh / 2; x2 = x1 + step; y2 = y1;
+            } else {                          /* right: content moves left */
+                x1 = sw * 0.72; y1 = sh / 2; x2 = x1 - step; y2 = y1;
+            }
+            if (y2 < sh * 0.08) y2 = sh * 0.08;
+            if (y2 > sh * 0.92) y2 = sh * 0.92;
+            if (x2 < sw * 0.08) x2 = sw * 0.08;
+            if (x2 > sw * 0.92) x2 = sw * 0.92;
 
-        int marker_start = mdc_show_tap(x1, y1, sw, sh);
-        double nx1 = 0, ny1 = 0, nx2 = 0, ny2 = 0;
-        if (mdc_normalize_hid_point(x1, y1, sw, sh, &nx1, &ny1) != 0) { nx1 = x1 / sw; ny1 = y1 / sh; }
-        if (mdc_normalize_hid_point(x2, y2, sw, sh, &nx2, &ny2) != 0) { nx2 = x2 / sw; ny2 = y2 / sh; }
-        double distance = cmd->direction <= 1 ? (y2 - y1) : (x2 - x1);
-        if (distance < 0) distance = -distance;
-        int steps = (int)(distance / 25.0);
-        if (steps < 12) steps = 12;
-        if (steps > 40) steps = 40;
-        if (send_phase(0, nx1, ny1) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
-        usleep(25000);
-        for (int i = 1; i <= steps; i++) {
-            if (send_phase(1, nx1 + (nx2 - nx1) * i / steps, ny1 + (ny2 - ny1) * i / steps) != 0) {
+            markers |= mdc_show_tap(x1, y1, sw, sh);
+            int steps = 0;
+            if (scroll_gesture(x1, y1, x2, y2, sw, sh, &steps) != 0) {
                 snprintf(resp, rsz, "err hid-dispatch-failed\n");
                 return;
             }
-            usleep(22000);
+            markers |= mdc_show_tap(x2, y2, sw, sh);
+            total_steps += steps;
+            gestures++;
+            remaining -= step;
+            if (settle_ms > 0) ax_wait_settled(settle_ms);
+            if (remaining > 0.5 && settle_ms > 0 && have_signature) {
+                uint64_t after = 0;
+                if (ax_content_signature(&after) == 0 && after == before_signature)
+                    break; /* content stopped moving: the edge was reached */
+                before_signature = after;
+            }
         }
-        /* press-and-hold before liftoff kills inertial momentum -> precise stop */
-        usleep(90000);
-        if (send_phase(2, nx2, ny2) != 0) { snprintf(resp, rsz, "err hid-dispatch-failed\n"); return; }
-        int marker_end = mdc_show_tap(x2, y2, sw, sh);
-        snprintf(resp, rsz, marker_start || marker_end ? "ok scroll %d\n" : "ok scroll %d marker-unavailable\n", steps);
+        snprintf(resp, rsz,
+                 markers ? "ok scroll %d\n" : "ok scroll %d marker-unavailable\n", total_steps);
+        return;
+    }
+    if (cmd->type == MDC_CMD_SCROLLTOP || cmd->type == MDC_CMD_SCROLLBOTTOM) {
+        if (!g_hid_ready) { snprintf(resp, rsz, "err hid-unavailable\n"); return; }
+        double sw = 0, sh = 0;
+        if (mdc_screen_size(&sw, &sh) != 0 || sw <= 0 || sh <= 0) {
+            snprintf(resp, rsz, "err screen-size-unavailable\n");
+            return;
+        }
+        int to_bottom = cmd->type == MDC_CMD_SCROLLBOTTOM;
+        int settle_ms = cmd->settle_ms;
+        int attempts = 0;
+        uint64_t previous = 0;
+        int have_previous = 0;
+        while (attempts < 24) {
+            double y1 = to_bottom ? sh * 0.72 : sh * 0.28;
+            double y2 = to_bottom ? sh * 0.10 : sh * 0.90;
+            int steps = 0;
+            if (scroll_gesture(sw / 2, y1, sw / 2, y2, sw, sh, &steps) != 0) {
+                snprintf(resp, rsz, "err hid-dispatch-failed\n");
+                return;
+            }
+            attempts++;
+            if (settle_ms > 0) ax_wait_settled(settle_ms);
+            uint64_t signature = 0;
+            if (ax_content_signature(&signature) != 0) break;
+            if (have_previous && signature == previous) break; /* edge reached */
+            previous = signature;
+            have_previous = 1;
+        }
+        snprintf(resp, rsz, "ok %s %d\n", to_bottom ? "scrollbottom" : "scrolltop", attempts);
+        return;
+    }
+    if (cmd->type == MDC_CMD_SCROLLTO) {
+        const char *label = cmd->text;
+        int direction = 1;
+        if (!strncmp(label, "--up ", 5)) { direction = 0; label += 5; }
+        else if (!strncmp(label, "--down ", 7)) { direction = 1; label += 7; }
+        while (*label == ' ') label++;
+        if (!label[0]) { snprintf(resp, rsz, "err invalid-arguments\n"); return; }
+        double sw = 0, sh = 0;
+        if (mdc_screen_size(&sw, &sh) != 0 || sw <= 0 || sh <= 0) {
+            snprintf(resp, rsz, "err screen-size-unavailable\n");
+            return;
+        }
+        int settle_ms = cmd->settle_ms;
+        double tolerance = sh * 0.06;
+        if (tolerance < 16) tolerance = 16;
+        if (tolerance > 60) tolerance = 60;
+        uint64_t previous = 0;
+        int have_previous = 0;
+        int no_move = 0;
+        for (int attempt = 0; attempt < 24; attempt++) {
+            double x = 0, y = 0, w = 0, h = 0;
+            int found = ax_find_frame(label, &x, &y, &w, &h);
+            if (found == -3) { snprintf(resp, rsz, "err ax-busy\n"); return; }
+            if (found == -1) { snprintf(resp, rsz, "err ax-unavailable\n"); return; }
+            if (found == 0) {
+                double cx = x + w / 2.0;
+                double cy = y + h / 2.0;
+                int center_on_screen = cx >= sw * 0.03 && cx <= sw * 0.97 &&
+                                       cy >= sh * 0.05 && cy <= sh * 0.95;
+                double delta = cy - sh / 2.0;
+                if (fabs(delta) <= tolerance || (center_on_screen && no_move)) {
+                    if (settle_ms > 0) ax_wait_settled(settle_ms);
+                    snprintf(resp, rsz, "ok scrollto %d %d %d %d\n",
+                             (int)x, (int)y, (int)w, (int)h);
+                    return;
+                }
+                double amount = fabs(delta);
+                if (amount > sh * 0.64) amount = sh * 0.64;
+                if (amount < 2) amount = 2;
+                double y1 = delta > 0 ? sh * 0.72 : sh * 0.28;
+                double y2 = delta > 0 ? y1 - amount : y1 + amount;
+                if (scroll_gesture(sw / 2, y1, sw / 2, y2, sw, sh, 0) != 0) {
+                    snprintf(resp, rsz, "err hid-dispatch-failed\n");
+                    return;
+                }
+            } else {
+                if (no_move) break; /* at the edge and still not found */
+                double y1 = direction ? sh * 0.72 : sh * 0.28;
+                double y2 = direction ? sh * 0.10 : sh * 0.90;
+                if (scroll_gesture(sw / 2, y1, sw / 2, y2, sw, sh, 0) != 0) {
+                    snprintf(resp, rsz, "err hid-dispatch-failed\n");
+                    return;
+                }
+            }
+            if (settle_ms > 0) ax_wait_settled(settle_ms);
+            if (settle_ms > 0) {
+                uint64_t signature = 0;
+                if (ax_content_signature(&signature) == 0) {
+                    if (have_previous && signature == previous) no_move = 1;
+                    else no_move = 0;
+                    previous = signature;
+                    have_previous = 1;
+                }
+            }
+        }
+        snprintf(resp, rsz, "err not-found\n");
         return;
     }
     snprintf(resp, rsz, "err invalid-command\n");
@@ -953,7 +1241,7 @@ static void *server_thread(void *arg) {
     return 0;
 }
 
-__attribute__((constructor)) static void mdcontrol_init(void) {
+__attribute__((constructor)) static void psychosis_init(void) {
     startup_log("constructor", 1);
     pthread_t t;
     pthread_attr_t a;
